@@ -21,7 +21,6 @@ library(tidyr)
 opts_chunk$set(echo = TRUE, 
                warning = FALSE, 
                message = FALSE,
-               results = 'hide', 
                cache = TRUE, 
                cache.lazy = FALSE,
                eval = TRUE,
