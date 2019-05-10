@@ -8,8 +8,6 @@ Overview of directories:
 - `analysis/`:
     - `main_figures.Rmd`: R markdown file to reproduce the figures in the manuscript.
     - `figures/`: figure used in manuscript (generated from `main_figures.Rmd`).
-    
-- `manuscript/`: contains manuscript.
-    
+        
 
 `git lfs` is required to clone this directory. Please see https://git-lfs.github.com/ for additional information.
