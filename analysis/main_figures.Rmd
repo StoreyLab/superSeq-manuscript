@@ -1,0 +1,663 @@
+---
+title: "Document to reproduce the results in the superSeq manuscript"
+author: "Andrew J. Bass, David G. Robinson, John D. Storey"
+date: "May 9, 2019"
+output:
+  pdf_document: default
+---
+
+```{r setup, echo = FALSE, warning = FALSE, message = FALSE}
+library(knitr)
+library(subSeq)
+library(superSeq)
+library(data.table)
+library(tidyverse)
+library(grid)
+library(gridExtra)
+library(gtable)
+library(cowplot)
+library(broom)
+library(tidyr)
+opts_chunk$set(echo = TRUE, 
+               warning = FALSE, 
+               message = FALSE,
+               results = 'hide', 
+               cache = TRUE, 
+               cache.lazy = FALSE,
+               eval = TRUE,
+               fig.pos = 'H',
+               dev = 'png')
+ggplot2_theme <- ggthemes::theme_tufte(base_family = "CMU Sans Serif") + 
+                 theme(strip.text = element_text(size = 7), 
+                   panel.border = element_rect(colour = "black", fill = NA),
+                   axis.line = element_line(colour = "black"), 
+                   axis.text = element_text(size=6), 
+                   axis.title=element_text(size = 7), 
+                   legend.text=element_text(size = 7), 
+                   legend.title = element_text(size = 7), 
+                   title = element_text(size = 7))
+```
+
+```{r load_data}
+# Load experiment information
+load("../data/contrastsData.rda")
+# Load results from applying subSeq
+expressionAtlas <- readRDS("../data/subSeq_EA.rda")
+
+# Make "experiment|contrast" column called "ID" and rename voomLimma to limma
+contrastsData$ID <- paste0(contrastsData$experiment, "|", contrastsData$contrast)
+expressionAtlas$ID <- paste0(expressionAtlas$experiment, "|", expressionAtlas$contrast)
+expressionAtlas$method <- as.factor(expressionAtlas$method)
+levels(expressionAtlas$method) <- c("DESeq2", "edgeR", "limma")
+
+# Drop unused columns
+expressionAtlas <- expressionAtlas %>%
+  select(-depth, -contrast, -concordance, -rFDP, -estFDP, -pearson)
+```
+
+```{r filter-1}
+# Identify low powered studies: fewer than 100 DEG < 1/3 read depth
+# These studies are poor studies to test the model on
+low_sig_studies <- expressionAtlas %>%
+  filter(proportion == sort(unique(expressionAtlas$proportion))[253]) %>%
+  group_by(ID, method) %>%
+  filter(mean(significant) < 100) %>% 
+  select(ID, method)
+
+# Filter low powered studies
+expressionAtlas <- expressionAtlas %>%
+  anti_join(low_sig_studies, by = c("ID", "method"))
+
+df <- expressionAtlas %>%
+  filter(proportion == 1, presample == 1, replication == 1) %>%
+  group_by(method) %>%
+  summarise(length(ID))
+write.table(df, file = "./summary-total-cutoff.txt")
+```
+
+```{r filter-2}
+# Filter subSeq curves: High variance, non-monotonic, and other unstable shapes
+filt_ids <- read.csv("../data/filtered_studies.txt")
+filt_ids <- filt_ids %>% filter(keep == "no")
+filt_ids$ID <- as.character(filt_ids$ID)
+expressionAtlas <- expressionAtlas %>% anti_join(filt_ids, by = c("ID", "method"))
+
+df <- expressionAtlas %>%
+  filter(proportion == 1, presample == 1, replication == 1) %>%
+  group_by(method) %>%
+  summarise(length(ID))
+write.table(df, file = "./summary-filtered-studies.txt")
+
+# Partition the subsampling curve to three different presamples
+data_half <- expressionAtlas %>% filter(proportion <= .5) %>% mutate(presample = 0.5)
+data_third <- expressionAtlas %>% filter(proportion <= 1/3) %>% mutate(presample = 0.33)
+expressionAtlas <- bind_rows(list(data_third, data_half, expressionAtlas))
+
+# Merge experiment info (contrastsData) with subSeq results
+contrastsData <- contrastsData %>% rename(obs_depth = depth)
+expressionAtlas <- expressionAtlas %>% left_join(contrastsData)
+```
+
+```{r fits_probit}
+# NLS algorithm parameters
+defaultNLSControl$tol <- 0.000001
+defaultNLSControl$minFactor <-1 / 5024
+defaultNLSControl$maxiter <- 10000
+
+# Quite of few experiments have subsampling instability at 0.001-0.01. Instead, train the model on 0.01-1 range in order to use these experiments in the study.
+# Probit model
+fits.probit <- expressionAtlas %>%
+  filter(proportion >= 0.01) %>%
+  group_by(method, ID, presample) %>% 
+  do(fit = fitnls(., method = "probit", control = defaultNLSControl), dat = as.data.frame(.))
+fits.probit$model <- "probit"
+```
+
+```{r fits_logit, dependson = "fits_probit"}
+# Logit model
+fits.logit <- expressionAtlas %>% 
+  filter(proportion >= 0.01) %>%
+  group_by(method, ID, presample) %>% 
+  do(fit = fitnls(., method = "logit", control = defaultNLSControl), dat = as.data.frame(.))
+fits.logit$model <- "logit"
+```
+
+```{r fits_smoother, dependson = "fits_probit"}
+# Smoother model
+fits.smoother <- expressionAtlas %>%
+  filter(proportion >= 0.01) %>%
+  group_by(method, ID, presample) %>% 
+  do(fit = fitnls(., method = "smoother"), dat = as.data.frame(.))
+fits.smoother$model = "smoother"
+```
+
+```{r fits, dependson = c("fits_probit","fits_smoother", "fits_logit")}
+# Combine all of the model fits
+fits <- rbindlist(list(fits.probit, fits.logit, fits.smoother))
+rm(list = c("fits.smoother", "fits.logit", "fits.probit"))
+```
+
+```{r predictions, dependson = "fits"}
+# Function to get predictions from NLS model fits 
+predict0 <- failwith(-1, predict, quiet = TRUE)
+predict_func <- function(fit, data, model) {
+  if (model == "smoother") {
+    predict0(fit, x = data)$y
+  } else {
+    predict0(fit, newdata = data.frame(proportion = data))
+  }
+}
+
+# Get predictions
+predictions <- fits %>% 
+  group_by(method, ID, presample, model) %>%
+  do(cbind(select(.$dat[[1]], -method, -ID, -presample), 
+           predicted = predict_func(fit =.$fit[[1]][[1]], 
+                                    data = .$dat[[1]]$proportion / .$presample,
+                                    model = .$model)))
+predictions$presample <- factor(predictions$presample, labels = c("Third", "Half", "Full"))
+```
+
+```{r reported_values, dependson = "load_data"}
+# Reported values for paper/figure
+df <- data.frame(
+  num.experiments = length(unique(contrastsData$experiment)),
+  num.filt.exp = length(unique(expressionAtlas$experiment)),
+  num.filt.con = length(unique(expressionAtlas$ID)),
+  num.contrasts = length(unique(contrastsData$ID)),
+  num.replicates = length(unique(expressionAtlas$replication)),
+  num.proportions = length(unique(expressionAtlas$proportion)))
+write.table(t(df), file = "./meta-analysis.txt", col.names = FALSE)
+```
+
+```{r figure1, fig.width = 5.7, dpi = 700, fig.height = 3.5}
+# Plotting theme
+ggplot2_theme <- ggthemes::theme_tufte(base_family = "CMU Sans Serif") +
+                 theme(panel.border = element_rect(colour = "black", fill = NA),
+                   axis.line = element_line(colour = "black"))
+
+# Two experiments of the same species: one is saturated (E-MTAB-5313|g1_g2) and the other is undersaturated (E-GEOD-59814|g1_g2)
+selected.IDs <- c("E-GEOD-59814|g1_g2", "E-MTAB-5313|g1_g2")
+
+# Use DESeq2 model fits
+selected.fits <- fits %>% ungroup() %>%
+                 filter(ID %in% selected.IDs, presample == 1, model == "probit", method == "DESeq2")
+
+# Since we filtered out 0.001-0.01 proportions for the model fitting, add back this data
+selected.fits[1,]$dat[[1]] <- expressionAtlas %>% inner_join(selected.fits[1,], by = c("ID", "method", "presample"))
+selected.fits[2,]$dat[[1]] <- expressionAtlas %>% inner_join(selected.fits[2,], by = c("ID", "method", "presample"))
+
+# Use model to predict double the subsampling proportion
+predictions.fits <- selected.fits %>% 
+                    group_by(method, ID, presample, model) %>% 
+                    do(cbind(dplyr::select(.$dat[[1]], -method, -ID, -presample), 
+                             predicted = predict_func(fit =.$fit[[1]][[1]], data = .$dat[[1]]$proportion * 2, model = .$model)))
+
+# Convert subsampling proportion to observed read depth
+# Rename studies for illustration
+example.exp = predictions.fits %>% mutate(depth = proportion * obs_depth)
+example.exp$ID <- factor(example.exp$ID, labels = c("Undersaturated", "Saturated"))
+
+###########
+# Things get rough here: Adding text to Figure 1 so need to identify locations and such
+maxdepth <- example.exp %>% group_by(ID) %>%  summarise(max_depth = max(depth))
+md0 <- maxdepth$max_depth[1]
+md <- maxdepth$max_depth[2]
+start = c(md + .5e7, md0 + 9e6, md - .5e7, md0 - 9e6)
+end = c(md + 4.7e7 / 1.1, md0 + 72e6 / 1.1,md - 4.7e7 / 1.1, md0 - 72e6 / 1.1)
+start2 = c(md + 3.3e7 / 3.9, 1.05e8)
+end2 = c(md, md0)
+textdat <- data.frame(x = c((start[1:4] + end[1:4]) / 2, 9e7, md0 + 50e6, 3.5e7, 5.5e7), 
+                      y = c(5500, 3000, 3700, 1100, 4400, 2050, 2900, 650), 
+                      ID =  c("Saturated", "Undersaturated"),
+                      labs = c("superSeq", "superSeq", "subSeq", "subSeq", "Predict improvement\nin statistical power", "Predict improvement\nin statistical power", "Learn relationship\nbetween read depth\nand statistical power", "Learn relationship\nbetween read depth\nand statistical power"))
+
+arrdat <- data.frame(x = start, 
+                     xend = end, 
+                     y = c(5300,2900,3500,1000), 
+                     ID =  c("Saturated", "Undersaturated"), 
+                     labs=c("ss", "ss", "ss2","ss2"), 
+                     cc = c("red2", "blue2"))
+arrdat2 <- data.frame(x = start2, 
+                      xend = end2, 
+                      y = c(110, 110), 
+                      ID = c("Saturated", "Undersaturated"), 
+                      labs = c("superSeq", "superSeq"))
+###########
+
+# Plotting data: separate both experiments and then combine with grid (this is so we can combine with grid and add plot labels).
+p0 <- example.exp %>% 
+      filter(ID == "Saturated") %>% 
+      ggplot(aes(depth, significant))  +
+        geom_point(size = 1, alpha = .05, color = "blue2") +
+        geom_line(aes(y = predicted, x = depth * 2), lty = 2, size = 1.0, color = "red2", data = example.exp %>% filter(ID == "Saturated")) +
+        facet_wrap(~ ID, scale = "free_x") +
+        geom_vline(aes(xintercept = max_depth), lty=3, data = maxdepth %>% filter(ID == "Saturated"))  +
+        geom_text(aes(x=8.9e7 + 2.5e6, group = NULL, color = NULL, label = "Read depth of\n\n", y = 50), colour = "black", angle = 0, size = 6 * .35, data=maxdepth %>% filter(ID == "Saturated")) +
+        geom_text(aes(x = 8.9e7 + .6e7, group = NULL, color = NULL,label = "\n experiment~(D[0])", y=50), parse = T, colour = "black", angle = 0, size = 6 * .35, data = maxdepth %>% filter(ID == "Saturated")) +
+        geom_text(aes(label = labs, x, y, group = NULL, color = NULL), data = textdat %>% filter(ID == "Saturated"), size = 6 * .35, show_guide = FALSE) +
+        geom_segment(aes(x = x, y = y, xend = xend, yend = y), color = "red2", inherit.aes = FALSE, data = arrdat %>% filter(labs == "ss", ID == "Saturated"), size = 0.8, arrow = arrow(length=unit(.25/3, "inches")))  +
+        geom_segment(aes(x = x, y = y, xend = xend, yend = y), color = "blue2", inherit.aes = FALSE, data = arrdat %>% filter( labs == "ss2", ID == "Saturated"), size = 0.8, arrow = arrow(length=unit(.25/3, "inches"))) +
+        geom_segment(aes(x = x, y = y+50, xend = xend, yend = y-60), inherit.aes = FALSE, data = arrdat2 %>% filter(ID == "Saturated"),size =.5) +
+        ggplot2_theme + 
+        scale_fill_brewer(palette = "Set1") +
+        scale_linetype_manual(values=c( "dashed", "twodash", "solid")) +
+        scale_color_manual(values=c("darkgreen","blue2", "red")) +
+        ylim(0,5500) +  #3100
+        scale_x_continuous(breaks=c(0, 3e7, 6e7, 9e7, 12e7), labels = c("0", "30","60", "90", "120")) 
+
+# Similar to p0 but ID is Undersaturated instead of Saturated
+p1 <- example.exp %>% 
+      filter(ID == "Undersaturated") %>% 
+      ggplot(aes(depth, significant))  +
+        geom_point(size = 1, alpha = .05, color = "blue2") +
+        geom_line(aes(y = predicted, x = depth * 2), lty = 2, size = 1.0, color = "red2", data = example.exp %>% filter(ID == "Undersaturated")) +
+        facet_wrap(~ ID, scale = "free_x") +
+        geom_vline(aes(xintercept = max_depth), lty=3, data = maxdepth %>% filter(ID == "Undersaturated"))  +
+        geom_text(aes(x=1.14e8 + 1.8e7, group = NULL, color = NULL, label = "Read depth of\n\n", y = 50), colour = "black", angle = 0, size = 6 * .35, data=maxdepth %>% filter(ID == "Undersaturated")) +
+        geom_text(aes(x = 1.14e8 + 2.2e7, group = NULL, color = NULL,label = "~\n~\nexperiment~(D[0])", y=50), parse = TRUE, colour = "black", angle = 0, size = 6 * .35, data = maxdepth %>% filter(ID == "Undersaturated")) +
+        geom_text(aes(label = labs, x, y, group = NULL, color = NULL), data = textdat %>% filter(ID == "Undersaturated"), size = 6 * .35, show_guide = FALSE) +
+        geom_segment(aes(x = x, y = y, xend = xend, yend = y), color = "red2", inherit.aes = FALSE, data = arrdat %>% filter(labs == "ss", ID == "Undersaturated"), size = 0.8, arrow = arrow(length=unit(.25/3, "inches")))  +
+        geom_segment(aes(x = x, y = y, xend = xend, yend = y), color = "blue2", inherit.aes = FALSE, data = arrdat %>% filter( labs == "ss2", ID == "Undersaturated"), size = 0.8, arrow = arrow(length=unit(.25/3, "inches"))) +
+        geom_segment(aes(x = x, y = y, xend = xend, yend = y-60), inherit.aes = FALSE, data = arrdat2 %>% filter(ID == "Undersaturated"),size =.5) +
+        ggplot2_theme + 
+        scale_fill_brewer(palette = "Set1") +
+        scale_linetype_manual(values=c( "dashed", "twodash", "solid")) +
+        scale_color_manual(values=c("darkgreen","blue2", "red")) +
+        ylim(0,3100) + 
+        scale_x_continuous(breaks=c(0, 5e7, 10e7, 15e7), labels=c("0","50","100","150")) #+
+
+# Remove labels and add labels using grid package.
+p0 <- p0  + xlab("") + ylab("")
+p1 <- p1 + xlab("")+ ylab("")
+p <- arrangeGrob(p0,p1,ncol=2)
+theight <- unit(1, "points")
+twidth <- unit(16, "points")
+p <- arrangeGrob(p,  
+                 left = textGrob("Number of differentially expressed genes, G(D)", gp=gpar(fontfamily = "CMU Sans Serif", col="black", cex =.8), rot = 90, vjust = 2), 
+                 bottom = textGrob("Read depth (millions), D", gp=gpar(col="black", cex = .8), rot = 0, vjust = 0, hjust=.3))
+
+ggsave(p, filename = "./figures/figure1.png",width = 5.7, height = 3.5, dpi = 1000)
+```
+
+```{r, figure2, dependson = c("ggplot2_theme", "predictions", "load_data")}
+# Base theme for plot
+ggplot2_theme <- ggthemes::theme_tufte(base_family = "CMU Sans Serif") +
+                 theme(panel.border = element_rect(colour = "black", fill = NA),
+                   axis.line = element_line(colour = "black"))
+
+########## Figure 2a ##########
+# Set seed for random experiment draws: it is important to note we only draw from experiments where all three DE methods worked.
+set.seed(11111)
+num.curves <- 6
+get_ids <- predictions %>%
+  filter(presample == "Full", proportion == 1, replication == 1, model == "probit") %>%
+  group_by(ID) %>%
+  summarise(n = length(method)) %>% filter(n == 3) %>%
+  select(ID)
+selected.IDs <- sample(unique(get_ids$ID), num.curves, replace = FALSE)
+
+# Filter data for selected IDs
+predictions.random <- predictions %>% filter(ID %in% selected.IDs, model == "probit")
+
+# Plot of experiments with superSeq predicted curves
+p1<- predictions.random %>%
+     filter(presample == "Full") %>%
+     ggplot(aes(proportion, significant, color = method)) +
+       scale_colour_brewer(palette = "Set1") +
+       geom_point(size = .4, alpha = 0.1) +
+       geom_line(aes(y = predicted, lty = presample, group = interaction(method, presample)),
+                 data = predictions.random %>% mutate(proportion = proportion * ifelse(presample == "Third", 3, ifelse(presample == "Half",2,1)))) +
+       scale_linetype_manual(values = c(7,6,5,4, 3, 2, 1)) +
+       facet_wrap(~experiment, scale = "free_y", ncol = 3) +
+       xlab("Proportion of read depth") + 
+       ylab("Number of significant genes") + 
+       labs(color = "Method", lty = "Trained On") +
+       scale_linetype_manual(values = c("dashed", "twodash", "solid")) +
+       scale_color_manual(values = c("darkgreen","blue2", "red")) +
+       ggplot2_theme +
+       theme(axis.text.x = element_text(angle =45, hjust=1)) +
+    theme(legend.text=element_text(size=6),
+        legend.title=element_text(size=7))
+rm(list = c("predictions.random"))
+###########
+
+######### Figure 2b ##########
+# Get predictions at full read depth for each presample
+predictions.full <- predictions %>%
+                    group_by(ID, presample, method, model)%>%
+                    filter(proportion == max(proportion)) %>%
+                    summarise(predicted = mean(predicted))
+
+
+sig.full.tab <- expressionAtlas %>%
+  group_by(presample, ID, method) %>%
+  filter(proportion == max(proportion)) %>%
+  summarise(significant = mean(significant)) 
+sig.full.tab$presample <- factor(sig.full.tab$presample, labels = c("Third", "Half", "Full"))
+
+predictions.full <- predictions.full %>%
+                    inner_join(sig.full.tab, by = c("ID", "method", "presample"), copy = TRUE) %>% group_by(method, ID) %>%
+                    mutate(predicted =  predicted[presample == "Full"] / significant,
+                           actual = significant[presample == "Full"] / significant,
+                           amount = presample)
+
+# Log-log plot comparing predicted increase is significant genes versus observed
+p2 <- predictions.full %>%
+      group_by() %>%
+      filter(!(presample == "Full"), model == "probit") %>%
+      ggplot(aes(actual, predicted)) +
+        geom_point(size = .65, alpha = 0.25) +
+        geom_abline(col = "black") +
+        facet_grid(presample ~ method, as.table = FALSE) +
+        xlab("Actual relative increase in significant genes") +
+        ylab("Predicted relative increase in significant genes") +
+        ggplot2_theme +
+        coord_fixed()
+#############
+
+########## Figure 3c ##########
+# Get observed # significant genes
+sig.full.tab <- expressionAtlas %>%
+                filter(proportion == 1, presample == 1) %>%
+                group_by(ID, method) %>%
+                summarise(sig.full = mean(significant))
+
+predictions.full <- predictions %>%
+                    group_by(ID, presample, method, model)%>%
+                    filter(proportion == max(proportion)) %>%
+                    summarise(predicted = mean(predicted))
+# Combine previous two data frames
+predictions.full <- predictions.full %>%
+                    inner_join(sig.full.tab, by = c("ID", "method"), copy = TRUE) %>%
+                    mutate(predicted = predicted,
+                           actual = sig.full,
+                           amount = presample)
+
+# Box plot showing % increase/decrease from actual power
+predictions.full$model <- factor(predictions.full$model, levels = c('probit', 'logit', 'smoother'), ordered = TRUE)
+p3 <- predictions.full %>%
+      group_by() %>%
+      filter(!(presample == "Full")) %>% 
+      ggplot(aes(model,  100 * (predicted - actual) / actual)) +
+        geom_boxplot(outlier.colour = NA) +
+        geom_hline(yintercept = 0, col = "grey39", linetype = 2) +
+        facet_grid(presample ~ method, as.table = FALSE, scales = "free") +
+        xlab("Method") +
+        ylab("Percent difference from expected value") +
+        ggplot2_theme + scale_y_continuous(limits = c(-35,55)) + theme(axis.text.x = element_text(angle =45, hjust=1)) + scale_colour_brewer(palette = "Set1") 
+########## 
+
+rm(list = c("predictions.full",
+            "sig.full.tab"))
+
+# Use grid to combine the three plots 
+g.p1 <- ggplotGrob(p1) 
+g.p2 <- ggplotGrob(p2) 
+g.p3 <- ggplotGrob(p3)
+p1.widths <- g.p1$widths[1:3] 
+p3.widths <- g.p3$widths[1:3]                                 
+p2.widths <- g.p2$widths[1:3]
+max.widths <- unit.pmax(p1.widths, p2.widths) 
+g.p1$widths[1:3] <- max.widths 
+g.p2$widths[1:3] <- max.widths 
+g.p3$widths[1:3] <- max.widths
+p2.h <- g.p2$heights[1:3] 
+p3.h <- g.p3$heights[1:3]                               
+p1.h <- g.p1$heights[1:3] 
+max.widths <- unit.pmax(p2.h, p1.h, p3.h) 
+g.p1$heights[1:3] <- max.widths
+g.p3$heights[1:3] <- g.p2$heights[1:3]
+gout <- ggdraw() +
+  draw_plot(g.p1, 0, .5, 1, .5) +
+  draw_plot(g.p2, 0, 0, .5, .5) +
+  draw_plot(g.p3, .5, .05, .5, .39) +
+  draw_plot_label(c("a", "b", "c"), c(0, 0, 0.5), c(1, 0.5, 0.5), size = 12)
+ggsave(gout, filename = "./figures/figure2.png", width = 7, height = 7, dpi = 700)
+```
+
+```{r figure3, dependson = c("ggplot2_theme", "predictions", "fits", "load_data")}
+# Plot theme
+ggplot2_theme <- ggthemes::theme_tufte(base_family = "CMU Sans Serif") +
+                 theme(panel.border = element_rect(colour = "black", fill = NA),
+                   axis.line = element_line(colour = "black"))
+
+########### Figure 3a ###########
+set.seed(11111)
+# Significance threshold for plot
+max_sig_threshold <- 50
+
+# Calculate maximum significant in each first, so it can be filtered ... Grab only 75 curves
+# Various metrics comparing the different experiments (Percent of full read depth, spearman correlations)
+metrics <- expressionAtlas %>% 
+           filter(ID %in% sample(unique(expressionAtlas$ID), size = 75, replace = FALSE)) %>%
+           group_by(method, ID, presample) %>%
+           mutate(max_sig = significant[proportion == 1][1]) %>% 
+           gather(metric, value, significant:percent)
+metrics.filt <- metrics %>% filter(max_sig >= max_sig_threshold)
+metrics.ave <- metrics.filt %>%
+               group_by(proportion, method, ID, presample, metric) %>%
+               summarise(value = mean(value))
+
+metrics.sub <- c("percent", "spearman", "MSE", "estFDP")
+metrics.show <- metrics.ave %>%
+                group_by() %>%
+                filter(metric %in% metrics.sub & presample == 1) %>%
+                filter(presample == 1) %>%
+                filter(metric %in% c("percent", "spearman"))
+
+metrics.show$metric[metrics.show$metric == "percent"] <- "% significant"
+# Plot the different metrics
+p1 <- ggplot(metrics.show, aes(proportion, value, group = ID)) +
+     geom_line(alpha = 0.13) +
+     facet_grid(metric ~ method, scale = "free_y") +
+     theme(strip.background = element_blank(), axis.text.x = element_text(angle = 25, hjust=1)) +
+     scale_colour_brewer(palette = "Set1") +
+     xlab("Proportion of read depth") +
+     ylab("Relation between subsampled and full-depth") +
+     ggplot2_theme + theme(axis.text.x = element_text(angle =35, hjust=1))
+
+rm(list = c("metrics.filt",
+            "metrics.ave",
+            "metrics"))
+##########
+
+######### Figure b #########
+# Get fitted parameters from probit fit
+fits.behaved <- fits %>% filter(presample == 1, model == "probit")
+fits.behaved$experiment <- as.vector(sapply(fits.behaved$ID, FUN = function(x) strsplit(x, "\\|")[[1]][1]))
+fits.coef <- matrix(nrow = nrow(fits.behaved), ncol = 4)
+for (i in 1:nrow(fits.behaved)) fits.coef[i,] = coef(fits.behaved[i,]$fit[[1]]$fit)
+colnames(fits.coef) <- c("k", "mu", "s", "b")
+
+# Combine with fits data frame 
+params <- cbind(fits.behaved, fits.coef)
+
+# Get CDF value when p = 1 
+fits.slope <- params %>% 
+      filter(presample == 1)  %>% 
+      dplyr::select(method, experiment, ID, k, mu, s, b) %>%
+      group_by(method, ID) %>% 
+      mutate(prob = plnorm(1 + b, meanlog = mu, sdlog = s))
+
+## Estimate the number of undersaturated studies from model predictions
+df <- fits.slope %>% ungroup() %>%
+  group_by(method) %>%
+  summarise(saturated = 100 * sum(prob > .9) / length(prob))
+write.table(df, file = "./saturation-results.txt", row.names = FALSE)
+
+# Combine with experiment-level information
+fits.slope <- fits.slope %>%
+      ungroup() %>%
+      inner_join(contrastsData, by = c("ID", "experiment")) %>%
+      dplyr::group_by(method, organism) %>%
+      dplyr::mutate(tot.exp = length(unique(experiment))) %>% ungroup()
+
+# Data frame for each organism, # of base pairs, transcript_size, and Kingdom.
+df <- data.frame(organism = c("Rattus norvegicus", "Mus musculus", "Triticum aestivum", 'Sorghum bicolor', 'Homo sapiens', 'Arabidopsis thaliana', 'Oryza sativa Japonica Group', 'Drosophila melanogaster', 'Glycine max', 'Populus trichocarpa', 'Zea mays', 'Saccharomyces cerevisiae', 'Solanum tuberosum', 'Vitis vinifera', 'Ovis aries', 'Physcomitrella patens', 'Gallus gallus', 'Anas platyrhynchos', 'Medicago truncatula', 'Sus scrofa'),
+                 base_pairs = c(3042335753,	3486944526, 14547261565,  675363888, 3609003417, 135670229,  375049285,  142573017, 955370336, 422940594, 2104350183,  12157105, 727424546, 486175922, 2534344180,  471852792,  1285637921,  1069956150,  412800391,  2478444698),
+                 transcript_size =c(41078, 137862, 146597, 48559,206762, 55398, 43404, 34776,  91912, 74024,  138424,  7036, 57525, 30661,29118,  31691,  38118, 17169,  59988,  49448),
+                 Kingdom = c("Animalia", "Animalia", "Plantae", "Plantae", "Animalia", "Plantae", "Plantae", "Animalia", "Plantae", "Plantae", "Plantae", "Fungi", "Plantae", "Plantae", "Animalia", "Animalia", "Animalia", "Animalia", "Plantae", "Animalia"))
+
+# One experiment needs to be relabeled
+fits.slope$organism[fits.slope$organism == "Saccharomyces cerevisiae S288c"] <- "Saccharomyces cerevisiae"
+# Join information with fitted information
+fits.slope <- fits.slope %>%
+      inner_join(df, by = "organism", copy = TRUE) %>%
+  mutate(Type = ifelse(prob >= 0.9, "Saturated", "Undersaturated"))
+fits.slope$organism = factor(fits.slope$organism, 
+                             levels = unique(fits.slope$organism[order(fits.slope$base_pairs)]),
+                             ordered = TRUE)
+
+# Test for relationship between power and transcript size
+df <- fits.slope %>% group_by() %>%
+      group_by(method) %>%
+      do(broom::tidy(cor.test(as.numeric(.$prob), as.numeric(.$transcript_size), method = "spearman", exact = FALSE))[, c(1, 2, 3)])
+write.table(df, file = "./spearman-results-transcript-size.txt", row.names = FALSE)
+
+p2 <- ggplot(fits.slope, aes(transcript_size / 10 ^ 4, prob)) +
+  geom_point(size = 1, alpha = 0.25) + 
+  facet_wrap(~ method) +
+  xlab(expression("Transcriptome size (total transcripts, x" * 10^4 * ")")) +
+  ylab("Estimated power at full read depth") + 
+  geom_hline(yintercept = 0.9, color = "grey39", linetype = "dashed") +
+  ggplot2_theme + 
+  scale_colour_brewer(palette = "Set1")
+#####################
+
+########## Figure 3c ##########
+# Filter studies with at least 8 experiments and plot power
+p3 <- fits.slope %>% group_by(organism) %>%
+  filter(tot.exp > 8) %>%
+  ggplot(aes(x = organism, y = prob)) + 
+    geom_violin(scale = "count") +
+    stat_summary(fun.y = median, geom = "point", size = .8) + 
+    facet_grid(~method) + scale_color_manual(breaks = c("Animalia", "Plantae"), values = c("red", "green")) + 
+    ylab("Estimated power at full read depth")  +
+    scale_fill_continuous(name = "Average #\nReplicates", low = "firebrick", high = "firebrick1") +
+    ggplot2_theme +
+    scale_colour_brewer(palette = "Set1") +
+    geom_hline(yintercept = 0.9, color = "grey39", linetype = "dashed") +
+    theme(axis.line = element_line(colour = "black"), axis.text.x = element_text(angle = 37, size = 7, hjust=.95, vjust =1), 
+          panel.grid = element_line(),
+          panel.grid.major.x = element_blank(),
+          panel.grid.major.y = element_line(colour = "grey80", size = 0.2),
+          panel.grid.minor.y = element_line(colour = "grey80", size = 0.2)) + theme(axis.title.x=element_blank())
+
+rm(list = c("fits.behaved",
+            "params"))
+######################
+
+########## Figure 3d ################
+# Correlation test for per-gene read depth and power
+df <- fits.slope %>% 
+      group_by(method) %>%
+      do(broom::tidy(cor.test(as.numeric(.$obs_depth/.$genes), as.numeric(.$prob), method = "spearman", exact = FALSE))[, c(1, 2, 3)])
+write.table(df, file = "./spearman-results-gene-depth.txt", row.names = FALSE)
+
+p4 <- ggplot(fits.slope, aes(obs_depth / genes * (1/1000), prob)) +
+  geom_point(size = 1, alpha = 0.25) +
+  geom_text(data = df, aes(x = 19000 / 1000, y = .07, label = paste0("Spearman correlation: ", round(estimate, digits = 2), "\n", "p-value:", " < 0.05")), colour = "black", angle = 0, size = 1.2 * 4 * .35, family = "CMU Sans Serif") + 
+  facet_wrap(~ method) +
+  xlab("Average number of reads per gene (x1000)") +
+  ylab("Estimated power at full read depth") + 
+  geom_hline(yintercept = 0.9, color = "grey39", linetype = "dashed") +
+  ggplot2_theme +
+  scale_colour_brewer(palette = "Set1") 
+########## 
+
+##### Combine plots ##########
+g.p1 <- ggplotGrob(p1) 
+g.p2 <- ggplotGrob(p2)
+g.p3 <- ggplotGrob(p3)
+p1.widths <- g.p1$widths[1:3]
+p2.widths <- g.p2$widths[1:3] 
+max.widths <- unit.pmax(p1.widths, p2.widths)
+g.p1$widths[1:3] <- max.widths
+g.p2$widths[1:3] <- max.widths 
+g.p3$widths[1:3] <- max.widths
+g.p4 <- ggplotGrob(p4)
+p2.h <- g.p2$heights[1:3]
+p3.h <- g.p3$heights[1:3]                            
+p4.h <- g.p4$heights[1:3]
+max.widths <- unit.pmax(p2.h, p4.h, p3.h)
+g.p2$heights[1:3] <- max.widths 
+g.p4$heights[1:3] <- max.widths 
+g.p3$heights[1:3] <- max.widths 
+gout <- plot_grid(g.p1, g.p2, g.p3, g.p4, labels = c('a', 'b', 'c', 'd'), ncol = 2, align = "v")
+ggsave(gout, filename = "./figures/figure3.png", width = 8, height = 7, dpi = 700)
+```
+
+```{r figure4, dependson = c("ggplot2_theme", "predictions", "fits", "load_data")}
+# Plotting theme
+ggplot2_theme <- ggthemes::theme_tufte(base_family = "CMU Sans Serif") +
+                 theme(panel.border = element_rect(colour = "black", fill = NA),
+                   axis.line = element_line(colour = "black"))
+
+# Grab the same curves from figure 2
+set.seed(11111)
+num.curves <- 6
+get_ids <- predictions %>% filter(presample == "Full", proportion == 1, replication == 1, model == "probit") %>% group_by(ID) %>% summarise(n = length(method)) %>% filter(n == 3) %>% select(ID)
+selected.IDs <- sample(unique(get_ids$ID), num.curves, replace = FALSE)
+predictions.random <- predictions %>%
+                        ungroup() %>%
+                        filter(ID %in% selected.IDs, model == "probit")
+
+# Estimate slopes at the average values
+tmp <- predictions.random  %>%
+  group_by(method, replication, experiment, proportion, presample) %>%
+  summarise(significant = mean(significant)) %>%
+  dplyr::select(proportion, significant, presample, experiment, method) %>%
+  ungroup() %>%
+  distinct() %>%
+  filter(presample == "Full", proportion %in% unique(proportion)[seq(1, length(unique(proportion)), 4)])  %>%
+  group_by(method, experiment) %>%
+  do(cbind(proportion = .$proportion, broom::augment(smooth.spline(x = .$proportion, y = .$significant)))) %>% group_by(method, experiment) %>%
+  mutate(slope_obs = c(0, diff(.fitted, lag = 1) / diff(proportion, lag = 1))) %>%
+  filter(slope_obs > 0) 
+
+# Estimated slope at probit predicted values plotted with estimated slope at observed values (tmp)
+# Note one can just dlnorm to get slope values but to keep it consistent with the above estimate (empirical), we do it the same way
+gout <- predictions.random %>%
+  filter(proportion > 0.01, presample == "Full") %>%
+  dplyr::select(proportion, predicted, method, experiment) %>%
+  ungroup() %>%
+  distinct() %>%
+  group_by(method, experiment) %>%
+  mutate(slope_pred = c(0, diff(predicted, lag = 1) / diff(proportion, lag = 1))) %>%
+  ggplot(aes(x = proportion, y = slope_pred, color = method))  + facet_wrap(~experiment, scales = "free") + ylab(expression("rate of change, " ~ frac(dG(p),dp))) + xlab("proportion, p") +
+       scale_linetype_manual(values = c("dashed", "twodash", "solid")) +
+       scale_color_manual(values = c("darkgreen","blue2", "red")) +
+  geom_point(data = tmp %>% filter(proportion > 0.01), aes(x = proportion, y = slope_obs, color = method), alpha = 0.1, size = 0.8) + 
+       ggplot2_theme + 
+       theme(axis.text.x = element_text(angle = 45, hjust = 1)) +geom_line(alpha = 0.6)
+ggsave(gout, filename = "./figures/figure4.png", width = 7, height = 5, dpi = 700)
+```
+
+```{r model_params}
+ggplot2_theme <- ggthemes::theme_tufte(base_family = "CMU Sans Serif") +
+                 theme(panel.border = element_rect(colour = "black", fill = NA),
+                   axis.line = element_line(colour = "black"))
+
+# Get parameters for model fits
+fits.params <- fits %>%
+  filter(presample == 1, model != "smoother") %>%
+  group_by(method, ID, model, presample) %>%
+  do(as.data.frame(t(.$fit[[1]]$fit$m$getPars()))) %>%
+  gather(parameter, estimate, k:b)
+
+# Relabel for plotting
+fits.params$parameter <- factor(fits.params$parameter, labels = c(expression(b), expression(k), expression(mu), expression(sigma)))
+fits.params$model <- as.factor(fits.params$model)
+levels(fits.params$model) <- c("logit", "superSeq (probit)")
+
+# Compare model parameters between logit and probit models
+gout <- fits.params %>%
+  ggplot(aes(x = method, y = estimate, fill = model)) + geom_boxplot() + facet_wrap(~parameter, scales = "free", labeller= label_parsed) + ggplot2_theme + scale_fill_manual(values = c("blue2", "red2"))
+  
+ggsave(gout, filename = "./figures/figure5.png", width = 7, height = 5, dpi = 700)
+```
+
+```{r}
+sessionInfo()
+```

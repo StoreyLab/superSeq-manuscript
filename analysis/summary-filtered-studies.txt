@@ -1,0 +1,4 @@
+"method" "length(ID)"
+"1" "DESeq2" 859
+"2" "edgeR" 981
+"3" "limma" 851

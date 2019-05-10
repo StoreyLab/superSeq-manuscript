@@ -1,0 +1,6 @@
+"num.experiments" 465
+"num.filt.exp" 393
+"num.filt.con" 1021
+"num.contrasts" 1353
+"num.replicates" 6
+"num.proportions" 301
