@@ -12,4 +12,4 @@ Overview of directories:
 - `manuscript/`: contains manuscript.
     
 
-`git lfs` is required to clone this directory. Please see https://git-lfs.github.com/ for additional information information.
+`git lfs` is required to clone this directory. Please see https://git-lfs.github.com/ for additional information.
