@@ -1,4 +1,4 @@
-This contains the code used in [the pre-print](TODO).
+This contains the code used in "Determining sufficient sequencing depth in RNA-Seq differential expression studies" by Andrew J. Bass, David G. Robinson, and John D Storey available at https://www.biorxiv.org/content/10.1101/635623v1.
 
 Overview of directories:
 
